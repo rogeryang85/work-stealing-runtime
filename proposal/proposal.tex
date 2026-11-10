@@ -1,0 +1,136 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible}
+\setlist{nosep}
+
+\title{A Small Work-Stealing Task Runtime}
+\author{Roger Yang (hryang)}
+\date{15-418 Project Proposal}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{URL:} \url{https://rogeryang85.github.io/work-stealing-runtime/}
+
+\section*{Summary}
+I'm going to write a small Cilk-like task runtime in C++ with spawn/sync and
+per-thread work-stealing deques. I'll benchmark it on the GHC machines against a
+simple shared-queue version and against OpenMP tasks.
+
+\section*{Background}
+Lots of parallel code is recursive: you split the problem, spawn a task for one
+half, do the other half yourself, then wait. For example:
+
+\begin{lstlisting}
+int fib(int n) {
+  if (n < 2) return n;
+  int a, b;
+  spawn([&]{ a = fib(n - 1); });
+  b = fib(n - 2);
+  sync();
+  return a + b;
+}
+\end{lstlisting}
+
+This creates a huge number of tiny tasks, and the runtime has to spread them over
+a few threads. In work stealing, each thread keeps its own deque of tasks. It
+pushes and pops from the bottom, and when it runs out of work it steals from the
+top of someone else's deque. Most of the time threads only touch their own
+deque, so there's not much synchronization. I'll use the Chase--Lev lock-free
+deque [2] and do child stealing (a thief takes the spawned task, like OpenMP and
+TBB do). A thread waiting at a sync keeps running other tasks instead of blocking.
+
+\section*{The Challenge}
+\begin{itemize}
+  \item \textbf{The deque.} The owner and a thief can race for the last task, and
+        it's easy to get the memory orderings wrong. x86 hides a lot of these bugs,
+        so I'll also test on an ARM Mac.
+  \item \textbf{Overhead.} Tasks in fib do almost nothing, so things like
+        \texttt{malloc} per task or an atomic counter on every sync can end up
+        costing more than the actual work. I need the common case (spawn a task,
+        pop it right back) to be cheap, and I need to figure out when to stop
+        spawning.
+  \item \textbf{Workloads.} fib and n-queens are compute-bound and fairly
+        balanced. Quicksort depends on pivots and cares about cache locality.
+        Unbalanced Tree Search (UTS) [4] is very irregular, so lots of steals
+        happen and contention on victims becomes the bottleneck. A central queue
+        should do badly here.
+\end{itemize}
+
+\section*{Resources}
+GHC machines (i7-9700, 8 cores) for timing and an M-series Mac for testing on a
+weaker memory model. I'm starting from scratch with C++17
+\texttt{std::thread}/\texttt{std::atomic}. Baselines are OpenMP tasks with GCC
+(libgomp) and Clang (libomp). Main references are the Cilk-5 paper [1],
+Chase--Lev [2], and L\^e et al. [3], which gives a version of the deque that's
+correct on weak memory models. I may ask for PSC access if I get to the scaling
+stretch goal.
+
+\section*{Goals and Deliverables}
+\textbf{Plan to achieve:}
+\begin{itemize}
+  \item Working runtime: spawn/sync, Chase--Lev deque per thread, random stealing.
+  \item A central shared-queue runtime with the same API, for comparison.
+  \item fib, quicksort, n-queens and UTS, each in serial, my runtime, the
+        central queue, and OpenMP.
+  \item Per-thread task pools instead of \texttt{malloc}, and at least two other
+        steal policies (round-robin, last successful victim).
+  \item Stats per thread (steals, failed steals, idle time) and speedup graphs for
+        1--8 threads.
+  \item Targets: around 6$\times$ or better on n-queens and UTS with 8 threads,
+        beat libgomp on the fine-grained benchmarks (it's known to have high
+        per-task overhead), and get close to libomp.
+\end{itemize}
+
+\noindent\textbf{Hope to achieve:} match or beat libomp on UTS; adaptive
+granularity (lazy binary splitting [5]) so I don't need hand-picked cutoffs;
+spin vs.\ backoff vs.\ sleep for idle threads; scaling runs on a bigger PSC node.
+
+\medskip
+\noindent\textbf{If things go slowly:} a correct work-stealing runtime with random
+stealing, compared against the central queue and OpenMP on all four benchmarks.
+
+\medskip
+\noindent\textbf{Poster:} speedup graphs, plus a per-thread timeline for UTS
+showing when each thread was working, stealing, or idle.
+
+\medskip
+\noindent\textbf{Questions I want to answer:} Where does the per-task time go?
+At what task size does the central queue stop scaling? Which steal policy works
+best for balanced vs.\ irregular workloads, and why?
+
+\section*{Platform Choice}
+Work stealing is built for shared-memory multicore CPUs, and recursive, irregular
+tasks don't fit GPUs or SIMD well. C++ gives direct control over memory ordering and
+cache-line layout directly, which matters for the deque.
+
+\section*{Schedule}
+\begin{tabular}{@{}lp{0.72\textwidth}@{}}
+\toprule
+\textbf{Week} & \textbf{Tasks} \\
+\midrule
+Nov 9--15     & Thread pool, deque, stress tests on ARM and x86, spawn/sync, fib working. \\
+Nov 16--22    & Quicksort, n-queens, UTS; serial and OpenMP versions; central queue;
+                first speedup graphs. \\
+Nov 23        & \textbf{Milestone due} \\
+Nov 23--29    & Thanksgiving, so lighter. Task pools, per-thread stats, more steal policies. \\
+Nov 30--Dec 6 & Policy and granularity experiments; stretch goals if I'm ahead. \\
+Dec 7--10     & Final runs, timeline figure, report. \textbf{Report due Dec 10.} \\
+Dec 11        & \textbf{Poster session} \\
+\bottomrule
+\end{tabular}
+
+\section*{References}
+\begin{enumerate}[label={[\arabic*]}]
+  \item Frigo, Leiserson, Randall. The implementation of the Cilk-5 multithreaded language. PLDI 1998.
+  \item Chase, Lev. Dynamic circular work-stealing deque. SPAA 2005.
+  \item L\^e, Pop, Cohen, Zappa Nardelli. Correct and efficient work-stealing for weak memory models. PPoPP 2013.
+  \item Olivier et al. UTS: An unbalanced tree search benchmark. LCPC 2006.
+  \item Tzannes, Caragea, Barua, Vishkin. Lazy binary-splitting: a run-time adaptive work-stealing scheduler. PPoPP 2010.
+\end{enumerate}
+
+\end{document}
