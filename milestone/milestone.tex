@@ -1,0 +1,145 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\setlist{nosep}
+
+\title{A Small Work-Stealing Task Runtime: Milestone}
+\author{Roger Yang (hryang)}
+\date{15-418, November 23, 2026}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{URL:} \url{https://rogeryang85.github.io/work-stealing-runtime/}
+
+\section*{What I've done}
+The runtime works. It has a Chase--Lev deque per thread (memory orderings from
+L\^e et al.), \texttt{spawn}/\texttt{sync} through a \texttt{TaskGroup}, and random
+victim stealing. A thread waiting at a sync keeps running tasks instead of
+blocking. There's also a central-queue scheduler (one mutex-protected stack) behind
+the same API, so the two can be swapped with a flag. I wrote fib, quicksort,
+n-queens and a binomial UTS benchmark, each in serial, my runtime, and OpenMP tasks,
+and every run checks its answer against serial. Each worker also counts tasks run,
+steals and steal attempts.
+
+The deque passes a stress test on my M3 Pro (ARM, weak memory): one owner pushing
+and popping in bursts, 11 thieves, 2M items per round, starting from a capacity of 4
+so the resize path gets hit. Every item is taken exactly once.
+
+One bug worth mentioning: the central queue crashed on fib(35) with 4+ threads. It
+was a stack overflow, not a deadlock. With one shared LIFO, a thread waiting at a
+sync grabs whatever task is newest from anywhere, so frames nest very deep, and
+worker 0 was running on the 8\,MB main stack. Every worker now runs on a pthread
+with a 64\,MB stack (UTS needed this anyway, since its trees get deep).
+
+\section*{Preliminary results}
+These are from my laptop (Apple M3 Pro: 6 performance cores and 6 slower efficiency
+cores), compiled with GCC 14 \texttt{-O3}, median of 5 runs. Past 6 threads the
+extra cores are slower, so I mostly look at 1--6. GHC numbers are next.
+
+\begin{figure}[tbp]
+\centering
+\includegraphics[width=0.85\textwidth]{mac_speedup.png}
+\caption{Speedup on the M3 Pro. Gray line at 6 threads: past it the extra cores are efficiency cores.}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{speedup at 6 threads} & \\
+Benchmark & work stealing & central queue & libgomp & tasks \\
+\midrule
+fib(35)$^*$       & 5.6$\times$ & 0.16$\times$ & 0.10$\times$ & 14.9M \\
+quicksort, 20M    & 3.9$\times$ & 3.9$\times$ & 2.9$\times$ & 3.4K \\
+n-queens, n=14    & 5.3$\times$ & 4.0$\times$ & 4.4$\times$ & 65K \\
+UTS, 2.9M nodes   & 4.7$\times$ & 0.49$\times$ & 1.4$\times$ & 2.6M \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\small $^*$fib is relative to my runtime on 1 thread (see below); the others are relative to serial.}
+\end{center}
+
+What I take from this so far:
+\begin{itemize}
+  \item \textbf{Work stealing is the only thing that scales on fine-grained work.}
+        On fib and UTS, the central queue and libgomp both get \emph{slower} as
+        threads are added, because every spawn goes through shared state. Work
+        stealing keeps scaling, with only a few hundred steals on fib out of 15M
+        tasks.
+  \item \textbf{Per-task overhead is about 23\,ns.} fib(35) takes 0.35\,s as 15M tasks
+        on one thread vs.\ 0.011\,s serial. GCC heavily optimizes the plain
+        recursive serial version, which is why fib is measured against my own
+        1-thread run. Most of that 23\,ns is probably \texttt{new} plus the
+        \texttt{std::function}, which is what task pools are for.
+  \item \textbf{Quicksort is limited by the serial partition, not the scheduler.}
+        All three schedulers are about the same because there are only 3.4K tasks
+        and the first partition of 20M elements is serial. Idle workers make 1--2M
+        failed steal attempts while that happens, which is a good case for testing
+        idle policies.
+  \item \textbf{Granularity matters a lot.} With a cutoff, everything gets faster, and
+        the central queue catches up once tasks are big enough
+        (cutoff $\ge$ 20), though libgomp stays about 1.6$\times$ slower. Work stealing beats serial from cutoff 8 on.
+\end{itemize}
+
+\begin{figure}[tbp]
+\centering
+\includegraphics[width=0.62\textwidth]{mac_granularity.png}
+\caption{fib(35) at 6 threads as the serial cutoff grows.}
+\end{figure}
+
+\section*{Goals}
+I'm on track with the proposal. Done from the ``plan to achieve'' list: the runtime,
+the central queue, all four benchmarks in every version, steal counters, and
+1--12 thread speedup graphs. Still to do: task pools, two more steal policies,
+idle-time stats, the libomp comparison, and running everything on GHC. The 6$\times$
+target on n-queens and UTS looks reachable on 8 real cores; I'm at 5.3$\times$ and
+4.7$\times$ on 6 performance cores. Beating libgomp is already done. Getting
+close to libomp is still open. For the stretch goals, I think lazy binary splitting
+and the idle-policy study are realistic; PSC and continuation stealing probably
+aren't.
+
+\medskip
+\noindent\textbf{Updated goals for the poster:}
+\begin{itemize}
+  \item Speedup graphs on GHC (8 cores) for all four benchmarks vs.\ central queue,
+        libgomp and libomp.
+  \item Before/after task pools, with a breakdown of per-task overhead.
+  \item Steal policy comparison (random, round-robin, last successful victim).
+  \item A per-thread timeline for UTS (working / stealing / idle).
+  \item Stretch: idle policy (spin vs.\ backoff vs.\ sleep) and lazy binary splitting.
+\end{itemize}
+
+\section*{Poster plan}
+Graphs, not a live demo: the speedup grid, the granularity plot, the overhead
+breakdown, and the UTS timeline.
+
+\section*{Concerns}
+\begin{itemize}
+  \item Nothing is blocking. The rest is coding and measuring.
+  \item Some runs are short (2--20\,ms for n-queens and coarse fib). I'll make
+        those problems bigger on GHC so timing noise doesn't matter.
+  \item Help-while-waiting can nest stack frames without bound, which is how the
+        central queue crashed. Big stacks fix it for now; I'd like to measure how
+        deep it actually gets.
+  \item I need to install libomp and get GHC runs going (my Kerberos ticket
+        expired, so that's just a \texttt{kinit}).
+\end{itemize}
+
+\section*{Schedule}
+\begin{tabular}{@{}lp{0.75\textwidth}@{}}
+\toprule
+\textbf{When} & \textbf{Task (all Roger)} \\
+\midrule
+Nov 23--25 & Run the sweep on GHC; add libomp; bigger inputs for short benchmarks. \\
+Nov 26--29 & Thanksgiving. Per-thread task pools; overhead breakdown for fib. \\
+Nov 30--Dec 2 & Round-robin and last-victim steal policies; compare on all benchmarks. \\
+Dec 3--6 & Idle-time stats and UTS timeline trace + plot; idle policy study if time. \\
+Dec 7--8 & Final GHC runs; lazy binary splitting if ahead. \\
+Dec 9--10 & Final report. \textbf{Due Dec 10.} \\
+Dec 11 & Poster session. \\
+\bottomrule
+\end{tabular}
+
+\end{document}
