@@ -15,99 +15,66 @@
 
 \noindent\textbf{URL:} \url{https://rogeryang85.github.io/work-stealing-runtime/}
 
-\section*{Change of focus}
-Based on the proposal feedback, I'm not trying to beat Cilk or OpenMP. The project
-is now about how the runtime scales and how much each design choice matters.
-libgomp stays in the graphs only as a reference point.
+\section*{Focus}
+Per the proposal feedback, I'm not trying to beat Cilk or OpenMP. The focus is how
+the runtime scales and how much each design choice matters. It's a plain C++
+library with no compiler support, so programs must be strict fork-join
+(\texttt{spawn}/\texttt{wait} in a \texttt{TaskGroup}), and thieves steal children
+instead of continuations.
 
-I'm also going with the simplified interface: a plain C++ library with no compiler
-support. Programs have to be strict fork-join. Every task spawned in a
-\texttt{TaskGroup} must be waited on before the group goes out of scope, and tasks
-are closures. Without compiler support I can't steal continuations like Cilk does,
-so thieves steal spawned children, and \texttt{wait()} runs other tasks instead of
-suspending. The cost is that a waiting worker's stack can keep growing, so threads
-get big stacks.
-
-\section*{Work so far}
-The runtime works: a Chase--Lev deque per thread, spawn/wait through
-\texttt{TaskGroup}, and random stealing. A central-queue scheduler with the same API
-is the first design comparison. fib, quicksort, n-queens and UTS are written in
-serial, my runtime, and OpenMP tasks, and every run checks its answer against
-serial. The deque passes a stress test on ARM (1 owner, 11 thieves).
+\section*{Progress}
+Done: a Chase--Lev deque per thread with random stealing, a central-queue
+scheduler with the same API, and fib, quicksort, n-queens and UTS in serial, my
+runtime and OpenMP. All results are checked against serial. This matches the
+proposal schedule.
 
 \section*{Preliminary results}
-From my laptop (M3 Pro, 6 performance + 6 efficiency cores), GCC 14 \texttt{-O3},
-median of 5 runs. Past 6 threads the cores are slower, so I compare at 6.
+M3 Pro laptop, 6 performance cores, median of 5 runs. GHC runs are next.
 
 \begin{center}
+\includegraphics[width=0.62\textwidth]{mac_speedup.png}
+
+\medskip
 \begin{tabular}{@{}lrrr@{}}
 \toprule
 Speedup at 6 threads & work stealing & central queue & libgomp (ref.) \\
 \midrule
-fib(35), cutoff 1$^*$ & 5.3$\times$ & 0.22$\times$ & 0.15$\times$ \\
-quicksort, 20M        & 3.4$\times$ & 3.7$\times$  & 2.8$\times$ \\
-n-queens, n=14        & 5.3$\times$ & 3.6$\times$  & 4.3$\times$ \\
-UTS, 2.9M nodes       & 4.6$\times$ & 0.38$\times$ & 1.3$\times$ \\
+fib(35)$^*$     & 5.3$\times$ & 0.22$\times$ & 0.15$\times$ \\
+quicksort, 20M  & 3.4$\times$ & 3.7$\times$  & 2.8$\times$ \\
+n-queens, n=14  & 5.3$\times$ & 3.6$\times$  & 4.3$\times$ \\
+UTS, 2.9M nodes & 4.6$\times$ & 0.38$\times$ & 1.3$\times$ \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\small $^*$vs.\ my runtime on 1 thread, since serial fib with no tasks is 38$\times$
-faster. The rest are vs.\ serial.}
+{\small $^*$vs.\ my runtime on 1 thread, with one task per call. The rest are vs.\ serial.}
 \end{center}
 
-\begin{center}
-\includegraphics[width=0.62\textwidth]{mac_speedup.png}
-\end{center}
+\noindent With tiny tasks, the central queue gets slower as threads are added, while
+per-thread deques keep scaling. Each task costs about 27\,ns. Quicksort is limited
+by its serial first partition.
 
-\begin{center}
-\includegraphics[width=0.55\textwidth]{mac_granularity.png}
-\end{center}
-
+\section*{Remaining goals}
+Each one is a design choice, measured on GHC (8 cores):
 \begin{itemize}
-  \item \textbf{Scheduler.} With tiny tasks (fib, UTS), the central queue gets slower
-        as threads are added because every push and pop fights over one lock.
-        Per-thread deques keep scaling.
-  \item \textbf{Granularity.} Each task costs about 27\,ns. With a cutoff of 12--16,
-        fib runs 5.3$\times$ faster than serial. The central queue needs a cutoff
-        around 20 to catch up.
-  \item Quicksort is limited by its serial first partition, so the scheduler doesn't
-        matter much there.
+  \item task allocation: \texttt{new}/\texttt{delete} vs.\ per-thread pools
+  \item victim choice: random vs.\ round-robin vs.\ last successful victim
+  \item idle threads: spin vs.\ yield vs.\ sleep
+  \item task granularity (cutoff sweeps)
 \end{itemize}
-
-\section*{Goals}
-On track. Each remaining goal is one design choice, measured by speedup on GHC
-(8 cores) plus steal counts:
-\begin{itemize}
-  \item Task allocation: \texttt{new}/\texttt{delete} vs.\ per-thread task pools.
-  \item Victim choice: random vs.\ round-robin vs.\ last successful victim.
-  \item Idle workers: spin vs.\ yield vs.\ sleep, with idle-time stats.
-\end{itemize}
-Stretch: lazy binary splitting, so the runtime picks the cutoff instead of the
-programmer.
-
-\medskip
-\noindent\textbf{For the poster:} GHC scaling graphs for each design choice, the
-granularity graph, and a per-thread UTS timeline showing when workers are busy,
-stealing or idle.
-
-\section*{Poster plan}
-Graphs, no live demo.
+Stretch: lazy binary splitting. The poster will show scaling graphs for each choice
+plus a per-thread UTS timeline. No live demo.
 
 \section*{Concerns}
-Nothing is blocking. Some runs are only 10--20\,ms, so I'll use bigger inputs on
-GHC.
+None blocking. Some runs are only 10--20\,ms, so I'll use bigger inputs on GHC.
 
 \section*{Schedule}
-\begin{tabular}{@{}lp{0.75\textwidth}@{}}
+\begin{tabular}{@{}ll@{}}
 \toprule
-\textbf{When} & \textbf{Task (all Roger)} \\
-\midrule
-Nov 23--25 & GHC runs; deque stress test on x86; bigger inputs. \\
-Nov 26--29 & Thanksgiving. Task pools; fib overhead breakdown. \\
-Nov 30--Dec 2 & Round-robin and last-victim steal policies. \\
-Dec 3--6 & Idle policies, idle-time stats, UTS timeline. \\
-Dec 7--8 & Final GHC runs; lazy binary splitting if ahead. \\
-Dec 9--10 & Final report (due Dec 10). \\
-Dec 11 & Poster session. \\
+Nov 23--25    & GHC runs, deque test on x86, bigger inputs \\
+Nov 26--29    & Thanksgiving; task pools \\
+Nov 30--Dec 2 & Steal policies \\
+Dec 3--6      & Idle policies, granularity, UTS timeline \\
+Dec 7--10     & Final runs and report \\
+Dec 11        & Poster session \\
 \bottomrule
 \end{tabular}
 
