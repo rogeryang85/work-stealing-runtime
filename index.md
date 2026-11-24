@@ -27,7 +27,7 @@ The runtime works: Chase-Lev deques, spawn/sync, random stealing, plus a central
 | Nov 9–15 | Thread pool, deque, stress tests on ARM, spawn/sync, fib working | done |
 | Nov 16–22 | Quicksort, n-queens, UTS; serial and OpenMP versions; central queue; first speedup graphs | done |
 | Nov 23 | **Milestone** | done |
-| Nov 23–25 | Sweep on GHC; bigger inputs for short benchmarks | |
+| Nov 23–25 | Sweep on GHC; deque stress test on x86; bigger inputs for short benchmarks | |
 | Nov 26–29 | Per-thread task pools; overhead breakdown for fib | |
 | Nov 30–Dec 2 | Round-robin and last-victim steal policies | |
 | Dec 3–6 | Idle policies (spin / yield / sleep), idle-time stats, UTS timeline plot | |
