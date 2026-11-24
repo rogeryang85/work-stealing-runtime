@@ -1,6 +1,4 @@
 #!/bin/bash
-# Scaling + granularity sweeps. Usage: scripts/sweep.sh <tag>   (e.g. mac, ghc)
-# Writes results/<tag>_scaling.csv and results/<tag>_granularity.csv
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TAG=${1:-mac}
@@ -17,7 +15,6 @@ for b in fib qsort nqueens uts; do
   for i in ws cq omp; do
     for t in $THREADS; do
       r=$REPS
-      # these are very slow (seconds per run); fewer reps is plenty
       if [ $b = fib ] && [ $i != ws ] && [ $t -gt 1 ]; then r=3; fi
       $B --bench $b --impl $i --threads $t --reps $r --check >> $out
       echo "$b $i $t" >&2

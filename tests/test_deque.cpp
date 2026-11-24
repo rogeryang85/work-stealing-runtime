@@ -1,5 +1,3 @@
-// Stress test: one owner pushes/pops, several thieves steal. Every item must be
-// taken exactly once. Run on ARM (weak memory) as well as x86.
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -8,64 +6,91 @@
 
 #include "../src/deque.hpp"
 
+Deque<int64_t*>* deque;
+std::vector<int64_t> items;
+std::atomic<int>* seen;
+std::atomic<bool> done;
+std::atomic<int64_t> total_stolen;
+
+void thief() {
+  int64_t stolen = 0;
+  while (!done.load() || deque->size() > 0) {
+    int64_t* x = deque->steal();
+    if (x != nullptr) {
+      seen[*x]++;
+      stolen++;
+    }
+  }
+  total_stolen += stolen;
+}
+
 int main(int argc, char** argv) {
-  const int64_t N = argc > 1 ? atoll(argv[1]) : 5'000'000;
-  const int nthieves = argc > 2 ? atoi(argv[2]) : 7;
-  const int rounds = argc > 3 ? atoi(argv[3]) : 5;
+  int64_t n = 5000000;
+  int num_thieves = 7;
+  int rounds = 5;
+  if (argc > 1) n = atoll(argv[1]);
+  if (argc > 2) num_thieves = atoi(argv[2]);
+  if (argc > 3) rounds = atoi(argv[3]);
+
+  items.resize(n);
+  for (int64_t i = 0; i < n; i++) {
+    items[i] = i;
+  }
 
   for (int r = 0; r < rounds; r++) {
-    // Small initial capacity so grow() gets exercised under contention.
-    ws::Deque<int64_t*> dq(4);
-    std::vector<int64_t> items(N);
-    std::vector<std::atomic<uint8_t>> seen(N);
-    for (int64_t i = 0; i < N; i++) items[i] = i;
-    std::atomic<bool> done{false};
-    std::atomic<int64_t> stolen{0}, popped{0};
+    deque = new Deque<int64_t*>(4);
+    seen = new std::atomic<int>[n];
+    for (int64_t i = 0; i < n; i++) {
+      seen[i] = 0;
+    }
+    done = false;
+    total_stolen = 0;
 
     std::vector<std::thread> thieves;
-    for (int k = 0; k < nthieves; k++) {
-      thieves.emplace_back([&] {
-        int64_t local = 0;
-        while (!done.load(std::memory_order_acquire) || dq.size() > 0) {
-          int64_t* x = nullptr;
-          if (dq.steal(x) == ws::Deque<int64_t*>::StealResult::Ok) {
-            seen[*x].fetch_add(1, std::memory_order_relaxed);
-            local++;
-          }
-        }
-        stolen += local;
-      });
+    for (int k = 0; k < num_thieves; k++) {
+      thieves.push_back(std::thread(thief));
     }
 
-    // Owner: push in bursts, pop some back (like spawn/sync).
-    int64_t local = 0;
-    uint64_t rng = 12345 + r;
-    for (int64_t i = 0; i < N;) {
-      rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-      int burst = 1 + rng % 64;
-      for (int j = 0; j < burst && i < N; j++, i++) dq.push(&items[i]);
-      int pops = rng % (burst + 1);
+    int64_t popped = 0;
+    unsigned int seed = 12345 + r;
+    int64_t i = 0;
+    while (i < n) {
+      int burst = 1 + rand_r(&seed) % 64;
+      for (int j = 0; j < burst && i < n; j++) {
+        deque->push(&items[i]);
+        i++;
+      }
+      int pops = rand_r(&seed) % (burst + 1);
       for (int j = 0; j < pops; j++) {
-        if (int64_t* x = dq.pop()) {
-          seen[*x].fetch_add(1, std::memory_order_relaxed);
-          local++;
+        int64_t* x = deque->pop();
+        if (x != nullptr) {
+          seen[*x]++;
+          popped++;
         }
       }
     }
-    while (int64_t* x = dq.pop()) {
-      seen[*x].fetch_add(1, std::memory_order_relaxed);
-      local++;
+    while (true) {
+      int64_t* x = deque->pop();
+      if (x == nullptr) break;
+      seen[*x]++;
+      popped++;
     }
-    popped = local;
-    done.store(true, std::memory_order_release);
-    for (auto& t : thieves) t.join();
+
+    done = true;
+    for (int k = 0; k < num_thieves; k++) {
+      thieves[k].join();
+    }
 
     int64_t bad = 0;
-    for (int64_t i = 0; i < N; i++)
-      if (seen[i].load() != 1) bad++;
-    printf("round %d: popped=%lld stolen=%lld total=%lld bad=%lld\n", r, (long long)popped.load(),
-           (long long)stolen.load(), (long long)(popped + stolen), (long long)bad);
-    if (bad || popped + stolen != N) {
+    for (int64_t j = 0; j < n; j++) {
+      if (seen[j] != 1) bad++;
+    }
+    printf("round %d: popped=%lld stolen=%lld bad=%lld\n", r, (long long)popped,
+           (long long)total_stolen.load(), (long long)bad);
+
+    delete deque;
+    delete[] seen;
+    if (bad != 0 || popped + total_stolen != n) {
       printf("FAIL\n");
       return 1;
     }

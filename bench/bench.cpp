@@ -1,10 +1,3 @@
-// Benchmark driver.
-//
-//   bench --bench fib|qsort|nqueens|uts --impl serial|ws|cq|omp
-//         [--threads T] [--reps R] [--n N] [--cutoff C] [--check]
-//
-// Prints one CSV line:
-//   bench,impl,threads,n,cutoff,median_s,min_s,result,tasks,steals,steal_attempts
 #include <omp.h>
 
 #include <algorithm>
@@ -13,30 +6,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <vector>
 
 #include "../src/runtime.hpp"
 
-using Clock = std::chrono::steady_clock;
+long fib_serial(int n) {
+  if (n < 2) return n;
+  return fib_serial(n - 1) + fib_serial(n - 2);
+}
 
-// ---------------------------------------------------------------- fib
-// Tasks spawn all the way down unless n <= cutoff (then serial).
-
-static long fib_serial(int n) { return n < 2 ? n : fib_serial(n - 1) + fib_serial(n - 2); }
-
-static long fib_rt(int n, int cutoff) {
-  if (n <= cutoff || n < 2) return fib_serial(n);
+long fib_rt(int n, int cutoff) {
+  if (n < 2 || n <= cutoff) return fib_serial(n);
   long a, b;
-  ws::TaskGroup g;
+  TaskGroup g;
   g.spawn([&a, n, cutoff] { a = fib_rt(n - 1, cutoff); });
   b = fib_rt(n - 2, cutoff);
   g.wait();
   return a + b;
 }
 
-static long fib_omp(int n, int cutoff) {
-  if (n <= cutoff || n < 2) return fib_serial(n);
+long fib_omp(int n, int cutoff) {
+  if (n < 2 || n <= cutoff) return fib_serial(n);
   long a, b;
 #pragma omp task shared(a) firstprivate(n, cutoff)
   a = fib_omp(n - 1, cutoff);
@@ -45,284 +35,329 @@ static long fib_omp(int n, int cutoff) {
   return a + b;
 }
 
-// ---------------------------------------------------------------- quicksort
-// Serial partition, recurse in parallel, std::sort below cutoff elements.
-
-static int median3(int a, int b, int c) { return std::max(std::min(a, b), std::min(std::max(a, b), c)); }
-
-template <class Spawn>
-static void qs_step(int* a, long n, Spawn&& recurse) {
-  int p = median3(a[0], a[n / 2], a[n - 1]);
-  int* lt = std::partition(a, a + n, [p](int x) { return x < p; });
-  int* gt = std::partition(lt, a + n, [p](int x) { return !(p < x); });  // equal block
-  recurse(a, lt - a, gt, (a + n) - gt);
+int median_of_3(int a, int b, int c) {
+  if (a > b) std::swap(a, b);
+  if (b > c) std::swap(b, c);
+  if (a > b) std::swap(a, b);
+  return b;
 }
 
-static void qs_rt(int* a, long n, long cutoff) {
-  if (n <= cutoff) { std::sort(a, a + n); return; }
-  qs_step(a, n, [cutoff](int* l, long ln, int* r, long rn) {
-    ws::TaskGroup g;
-    g.spawn([=] { qs_rt(l, ln, cutoff); });
-    qs_rt(r, rn, cutoff);
-    g.wait();
-  });
+void partition3(int* a, long n, long* left_size, long* right_size) {
+  int pivot = median_of_3(a[0], a[n / 2], a[n - 1]);
+  long lt = 0, i = 0, gt = n;
+  while (i < gt) {
+    if (a[i] < pivot) {
+      std::swap(a[i], a[lt]);
+      lt++;
+      i++;
+    } else if (a[i] > pivot) {
+      gt--;
+      std::swap(a[i], a[gt]);
+    } else {
+      i++;
+    }
+  }
+  *left_size = lt;
+  *right_size = n - gt;
 }
 
-static void qs_omp(int* a, long n, long cutoff) {
-  if (n <= cutoff) { std::sort(a, a + n); return; }
-  qs_step(a, n, [cutoff](int* l, long ln, int* r, long rn) {
-#pragma omp task firstprivate(l, ln, cutoff)
-    qs_omp(l, ln, cutoff);
-    qs_omp(r, rn, cutoff);
+void qsort_rt(int* a, long n, long cutoff) {
+  if (n <= cutoff) {
+    std::sort(a, a + n);
+    return;
+  }
+  long left, right;
+  partition3(a, n, &left, &right);
+  int* r = a + (n - right);
+  TaskGroup g;
+  g.spawn([a, left, cutoff] { qsort_rt(a, left, cutoff); });
+  qsort_rt(r, right, cutoff);
+  g.wait();
+}
+
+void qsort_omp(int* a, long n, long cutoff) {
+  if (n <= cutoff) {
+    std::sort(a, a + n);
+    return;
+  }
+  long left, right;
+  partition3(a, n, &left, &right);
+  int* r = a + (n - right);
+#pragma omp task firstprivate(a, left, cutoff)
+  qsort_omp(a, left, cutoff);
+  qsort_omp(r, right, cutoff);
 #pragma omp taskwait
-  });
 }
 
-// ---------------------------------------------------------------- n-queens
-// Bitmask search; spawn a task per legal placement while row < cutoff.
-
-static long nq_serial(int n, int row, uint32_t cols, uint32_t d1, uint32_t d2) {
+long nqueens_serial(int n, int row, uint32_t cols, uint32_t diag1, uint32_t diag2) {
   if (row == n) return 1;
   long count = 0;
-  uint32_t avail = ~(cols | d1 | d2) & ((1u << n) - 1);
-  while (avail) {
-    uint32_t bit = avail & -avail;
-    avail -= bit;
-    count += nq_serial(n, row + 1, cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1);
+  uint32_t free = ~(cols | diag1 | diag2) & ((1u << n) - 1);
+  while (free != 0) {
+    uint32_t bit = free & -free;
+    free -= bit;
+    count += nqueens_serial(n, row + 1, cols | bit, (diag1 | bit) << 1, (diag2 | bit) >> 1);
   }
   return count;
 }
 
-static long nq_rt(int n, int row, uint32_t cols, uint32_t d1, uint32_t d2, int cutoff) {
-  if (row >= cutoff) return nq_serial(n, row, cols, d1, d2);
-  if (row == n) return 1;
-  long cnt[32] = {0};
+long nqueens_rt(int n, int row, uint32_t cols, uint32_t diag1, uint32_t diag2, int cutoff) {
+  if (row >= cutoff || row == n) return nqueens_serial(n, row, cols, diag1, diag2);
+  long counts[32];
   int k = 0;
-  uint32_t avail = ~(cols | d1 | d2) & ((1u << n) - 1);
-  {
-    ws::TaskGroup g;
-    while (avail) {
-      uint32_t bit = avail & -avail;
-      avail -= bit;
-      long* out = &cnt[k++];
-      g.spawn([=] { *out = nq_rt(n, row + 1, cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1, cutoff); });
-    }
-    g.wait();
+  uint32_t free = ~(cols | diag1 | diag2) & ((1u << n) - 1);
+  TaskGroup g;
+  while (free != 0) {
+    uint32_t bit = free & -free;
+    free -= bit;
+    long* out = &counts[k];
+    k++;
+    g.spawn([=] {
+      *out = nqueens_rt(n, row + 1, cols | bit, (diag1 | bit) << 1, (diag2 | bit) >> 1, cutoff);
+    });
   }
-  long s = 0;
-  for (int i = 0; i < k; i++) s += cnt[i];
-  return s;
+  g.wait();
+  long total = 0;
+  for (int i = 0; i < k; i++) total += counts[i];
+  return total;
 }
 
-static long nq_omp(int n, int row, uint32_t cols, uint32_t d1, uint32_t d2, int cutoff) {
-  if (row >= cutoff) return nq_serial(n, row, cols, d1, d2);
-  if (row == n) return 1;
-  long cnt[32] = {0};
+long nqueens_omp(int n, int row, uint32_t cols, uint32_t diag1, uint32_t diag2, int cutoff) {
+  if (row >= cutoff || row == n) return nqueens_serial(n, row, cols, diag1, diag2);
+  long counts[32];
   int k = 0;
-  uint32_t avail = ~(cols | d1 | d2) & ((1u << n) - 1);
-  while (avail) {
-    uint32_t bit = avail & -avail;
-    avail -= bit;
-    long* out = &cnt[k++];
+  uint32_t free = ~(cols | diag1 | diag2) & ((1u << n) - 1);
+  while (free != 0) {
+    uint32_t bit = free & -free;
+    free -= bit;
+    long* out = &counts[k];
+    k++;
 #pragma omp task firstprivate(out, bit)
-    *out = nq_omp(n, row + 1, cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1, cutoff);
+    *out = nqueens_omp(n, row + 1, cols | bit, (diag1 | bit) << 1, (diag2 | bit) >> 1, cutoff);
   }
 #pragma omp taskwait
-  long s = 0;
-  for (int i = 0; i < k; i++) s += cnt[i];
-  return s;
+  long total = 0;
+  for (int i = 0; i < k; i++) total += counts[i];
+  return total;
 }
 
-// ---------------------------------------------------------------- UTS
-// Binomial Unbalanced Tree Search (T3 shape from Olivier et al. 2006):
-// root has B0 children; every other node has M children with probability Q,
-// otherwise none. QM = 0.999; tree size depends a lot on the root seed (seed 2 -> 2.9M nodes). The real UTS
-// uses SHA-1 for its splittable RNG; we use iterated splitmix64 instead, with
-// kUtsRounds rounds standing in for the per-node hashing work.
+// Binomial UTS (T3 shape, Olivier et al. 2006), with splitmix64 instead of SHA-1.
+const int UTS_B0 = 2000;
+const int UTS_M = 8;
+const double UTS_Q = 0.124875;
+int uts_rounds = 64;
 
-static constexpr int kUtsB0 = 2000;
-static constexpr int kUtsM = 8;
-static constexpr double kUtsQ = 0.124875;
-static int kUtsRounds = 64;
-
-static inline uint64_t mix(uint64_t x) {
+uint64_t mix(uint64_t x) {
   x += 0x9E3779B97F4A7C15ull;
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
   return x ^ (x >> 31);
 }
-static inline uint64_t uts_work(uint64_t id) {
-  for (int i = 0; i < kUtsRounds; i++) id = mix(id);
+
+uint64_t uts_hash(uint64_t id) {
+  for (int i = 0; i < uts_rounds; i++) id = mix(id);
   return id;
 }
-static inline int uts_children(uint64_t h, bool root) {
-  if (root) return kUtsB0;
-  double u = (h >> 11) * (1.0 / 9007199254740992.0);
-  return u < kUtsQ ? kUtsM : 0;
-}
-static inline uint64_t uts_child_id(uint64_t h, int i) { return mix(h ^ (0xD1B54A32D192ED03ull * (i + 1))); }
 
-static long uts_serial(uint64_t id, bool root) {
-  uint64_t h = uts_work(id);
-  int nc = uts_children(h, root);
+int uts_num_children(uint64_t h, bool is_root) {
+  if (is_root) return UTS_B0;
+  double u = (h >> 11) / 9007199254740992.0;
+  if (u < UTS_Q) return UTS_M;
+  return 0;
+}
+
+uint64_t uts_child(uint64_t h, int i) {
+  return mix(h ^ (0xD1B54A32D192ED03ull * (i + 1)));
+}
+
+long uts_serial(uint64_t id, bool is_root) {
+  uint64_t h = uts_hash(id);
+  int nc = uts_num_children(h, is_root);
   long count = 1;
-  for (int i = 0; i < nc; i++) count += uts_serial(uts_child_id(h, i), false);
+  for (int i = 0; i < nc; i++) count += uts_serial(uts_child(h, i), false);
   return count;
 }
 
-static long uts_rt(uint64_t id, bool root) {
-  uint64_t h = uts_work(id);
-  int nc = uts_children(h, root);
+long uts_rt(uint64_t id, bool is_root) {
+  uint64_t h = uts_hash(id);
+  int nc = uts_num_children(h, is_root);
   if (nc == 0) return 1;
-  std::vector<long> big;
-  long small[kUtsM];
-  long* cnt = small;
-  if (nc > kUtsM) { big.resize(nc); cnt = big.data(); }
-  {
-    ws::TaskGroup g;
-    for (int i = 0; i < nc - 1; i++) {
-      long* out = &cnt[i];
-      uint64_t cid = uts_child_id(h, i);
-      g.spawn([out, cid] { *out = uts_rt(cid, false); });
-    }
-    cnt[nc - 1] = uts_rt(uts_child_id(h, nc - 1), false);
-    g.wait();
-  }
-  long count = 1;
-  for (int i = 0; i < nc; i++) count += cnt[i];
-  return count;
-}
-
-static long uts_omp(uint64_t id, bool root) {
-  uint64_t h = uts_work(id);
-  int nc = uts_children(h, root);
-  if (nc == 0) return 1;
-  std::vector<long> big;
-  long small[kUtsM];
-  long* cnt = small;
-  if (nc > kUtsM) { big.resize(nc); cnt = big.data(); }
+  std::vector<long> counts(nc);
+  TaskGroup g;
   for (int i = 0; i < nc - 1; i++) {
-    long* out = &cnt[i];
-    uint64_t cid = uts_child_id(h, i);
-#pragma omp task firstprivate(out, cid)
-    *out = uts_omp(cid, false);
+    long* out = &counts[i];
+    uint64_t child = uts_child(h, i);
+    g.spawn([out, child] { *out = uts_rt(child, false); });
   }
-  cnt[nc - 1] = uts_omp(uts_child_id(h, nc - 1), false);
-#pragma omp taskwait
-  long count = 1;
-  for (int i = 0; i < nc; i++) count += cnt[i];
-  return count;
+  counts[nc - 1] = uts_rt(uts_child(h, nc - 1), false);
+  g.wait();
+  long total = 1;
+  for (int i = 0; i < nc; i++) total += counts[i];
+  return total;
 }
 
-// ---------------------------------------------------------------- driver
+long uts_omp(uint64_t id, bool is_root) {
+  uint64_t h = uts_hash(id);
+  int nc = uts_num_children(h, is_root);
+  if (nc == 0) return 1;
+  std::vector<long> counts(nc);
+  for (int i = 0; i < nc - 1; i++) {
+    long* out = &counts[i];
+    uint64_t child = uts_child(h, i);
+#pragma omp task firstprivate(out, child)
+    *out = uts_omp(child, false);
+  }
+  counts[nc - 1] = uts_omp(uts_child(h, nc - 1), false);
+#pragma omp taskwait
+  long total = 1;
+  for (int i = 0; i < nc; i++) total += counts[i];
+  return total;
+}
 
-struct Opts {
-  std::string bench = "fib", impl = "ws";
-  int threads = 1, reps = 5;
-  long n = -1, cutoff = -1;
-  bool check = false;
-};
+const char* bench = "fib";
+const char* impl = "ws";
+int threads = 1;
+int reps = 5;
+long n = -1;
+long cutoff = -1;
+bool check = false;
+std::vector<int> data;
 
-static void usage() {
-  fprintf(stderr,
-          "usage: bench --bench fib|qsort|nqueens|uts --impl serial|ws|cq|omp\n"
-          "             [--threads T] [--reps R] [--n N] [--cutoff C] [--rounds K] [--check]\n");
+long run_serial() {
+  if (strcmp(bench, "fib") == 0) return fib_serial(n);
+  if (strcmp(bench, "qsort") == 0) {
+    std::sort(data.begin(), data.end());
+    return 0;
+  }
+  if (strcmp(bench, "nqueens") == 0) return nqueens_serial(n, 0, 0, 0, 0);
+  return uts_serial(n, true);
+}
+
+long run_rt() {
+  if (strcmp(bench, "fib") == 0) return fib_rt(n, cutoff);
+  if (strcmp(bench, "qsort") == 0) {
+    qsort_rt(data.data(), n, cutoff);
+    return 0;
+  }
+  if (strcmp(bench, "nqueens") == 0) return nqueens_rt(n, 0, 0, 0, 0, cutoff);
+  return uts_rt(n, true);
+}
+
+long run_omp() {
+  long result = 0;
+#pragma omp parallel num_threads(threads)
+#pragma omp single
+  {
+    if (strcmp(bench, "fib") == 0) {
+      result = fib_omp(n, cutoff);
+    } else if (strcmp(bench, "qsort") == 0) {
+      qsort_omp(data.data(), n, cutoff);
+    } else if (strcmp(bench, "nqueens") == 0) {
+      result = nqueens_omp(n, 0, 0, 0, 0, cutoff);
+    } else {
+      result = uts_omp(n, true);
+    }
+  }
+  return result;
+}
+
+void usage() {
+  fprintf(stderr, "usage: bench --bench fib|qsort|nqueens|uts --impl serial|ws|cq|omp\n");
+  fprintf(stderr, "             [--threads T] [--reps R] [--n N] [--cutoff C] [--rounds K] [--check]\n");
   exit(2);
 }
 
 int main(int argc, char** argv) {
-  Opts o;
   for (int i = 1; i < argc; i++) {
-    std::string a = argv[i];
-    auto next = [&]() -> const char* { if (i + 1 >= argc) usage(); return argv[++i]; };
-    if (a == "--bench") o.bench = next();
-    else if (a == "--impl") o.impl = next();
-    else if (a == "--threads") o.threads = atoi(next());
-    else if (a == "--reps") o.reps = atoi(next());
-    else if (a == "--n") o.n = atol(next());
-    else if (a == "--cutoff") o.cutoff = atol(next());
-    else if (a == "--rounds") kUtsRounds = atoi(next());
-    else if (a == "--check") o.check = true;
-    else usage();
-  }
-
-  if (o.reps < 1) o.reps = 1;
-
-  // Defaults chosen so serial runs take very roughly 0.3-1.5 s.
-  if (o.bench == "fib") { if (o.n < 0) o.n = 35; if (o.cutoff < 0) o.cutoff = 1; }
-  else if (o.bench == "qsort") { if (o.n < 0) o.n = 20'000'000; if (o.cutoff < 0) o.cutoff = 10'000; }
-  else if (o.bench == "nqueens") { if (o.n < 0) o.n = 14; if (o.cutoff < 0) o.cutoff = 5; }
-  else if (o.bench == "uts") { if (o.n < 0) o.n = 2; o.cutoff = 0; }  // n = root seed; seed 2 -> 2.9M nodes
-  else usage();
-
-  // Input for quicksort (regenerated before every rep, not timed).
-  std::vector<int> orig, data;
-  if (o.bench == "qsort") {
-    orig.resize(o.n);
-    uint64_t s = 42;
-    for (auto& x : orig) { s = mix(s); x = static_cast<int>(s >> 33); }
-  }
-
-  auto run_serial = [&]() -> long {
-    if (o.bench == "fib") return fib_serial(o.n);
-    if (o.bench == "qsort") { std::sort(data.begin(), data.end()); return 0; }
-    if (o.bench == "nqueens") return nq_serial(o.n, 0, 0, 0, 0);
-    return uts_serial(o.n, true);
-  };
-  auto run_rt = [&]() -> long {
-    if (o.bench == "fib") return fib_rt(o.n, o.cutoff);
-    if (o.bench == "qsort") { qs_rt(data.data(), o.n, o.cutoff); return 0; }
-    if (o.bench == "nqueens") return nq_rt(o.n, 0, 0, 0, 0, o.cutoff);
-    return uts_rt(o.n, true);
-  };
-  auto run_omp = [&]() -> long {
-    long r = 0;
-#pragma omp parallel num_threads(o.threads)
-#pragma omp single
-    {
-      if (o.bench == "fib") r = fib_omp(o.n, o.cutoff);
-      else if (o.bench == "qsort") qs_omp(data.data(), o.n, o.cutoff);
-      else if (o.bench == "nqueens") r = nq_omp(o.n, 0, 0, 0, 0, o.cutoff);
-      else r = uts_omp(o.n, true);
+    if (strcmp(argv[i], "--check") == 0) {
+      check = true;
+      continue;
     }
-    return r;
-  };
+    if (i + 1 >= argc) usage();
+    if (strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
+    else if (strcmp(argv[i], "--impl") == 0) impl = argv[i + 1];
+    else if (strcmp(argv[i], "--threads") == 0) threads = atoi(argv[i + 1]);
+    else if (strcmp(argv[i], "--reps") == 0) reps = atoi(argv[i + 1]);
+    else if (strcmp(argv[i], "--n") == 0) n = atol(argv[i + 1]);
+    else if (strcmp(argv[i], "--cutoff") == 0) cutoff = atol(argv[i + 1]);
+    else if (strcmp(argv[i], "--rounds") == 0) uts_rounds = atoi(argv[i + 1]);
+    else usage();
+    i++;
+  }
+  if (reps < 1) reps = 1;
 
-  std::unique_ptr<ws::Runtime> rt;
-  if (o.impl == "ws") rt.reset(new ws::Runtime(o.threads, ws::Sched::WorkStealing));
-  else if (o.impl == "cq") rt.reset(new ws::Runtime(o.threads, ws::Sched::CentralQueue));
-  else if (o.impl != "serial" && o.impl != "omp") usage();
+  if (strcmp(bench, "fib") == 0) {
+    if (n < 0) n = 35;
+    if (cutoff < 0) cutoff = 1;
+  } else if (strcmp(bench, "qsort") == 0) {
+    if (n < 0) n = 20000000;
+    if (cutoff < 0) cutoff = 10000;
+  } else if (strcmp(bench, "nqueens") == 0) {
+    if (n < 0) n = 14;
+    if (cutoff < 0) cutoff = 5;
+  } else if (strcmp(bench, "uts") == 0) {
+    if (n < 0) n = 2;  // root seed; seed 2 gives 2.9M nodes
+    cutoff = 0;
+  } else {
+    usage();
+  }
+
+  std::vector<int> original;
+  if (strcmp(bench, "qsort") == 0) {
+    original.resize(n);
+    uint64_t s = 42;
+    for (long i = 0; i < n; i++) {
+      s = mix(s);
+      original[i] = (int)(s >> 33);
+    }
+  }
+
+  Runtime* rt = nullptr;
+  if (strcmp(impl, "ws") == 0) {
+    rt = new Runtime(threads, WORK_STEALING);
+  } else if (strcmp(impl, "cq") == 0) {
+    rt = new Runtime(threads, CENTRAL_QUEUE);
+  } else if (strcmp(impl, "serial") != 0 && strcmp(impl, "omp") != 0) {
+    usage();
+  }
 
   std::vector<double> times;
   long result = 0;
-  ws::Stats st;
-  for (int r = 0; r <= o.reps; r++) {  // rep 0 is warmup
-    if (o.bench == "qsort") data = orig;
-    if (rt) rt->reset_stats();
-    auto t0 = Clock::now();
-    if (o.impl == "serial") result = run_serial();
-    else if (o.impl == "omp") result = run_omp();
-    else rt->run([&] { result = run_rt(); });
-    double sec = std::chrono::duration<double>(Clock::now() - t0).count();
-    if (r > 0) times.push_back(sec);
-    if (rt) st = rt->stats();
-    if (o.bench == "qsort") result = std::is_sorted(data.begin(), data.end()) ? 1 : -1;
+  Stats stats = {0, 0, 0};
+  for (int r = 0; r <= reps; r++) {
+    data = original;
+    if (rt != nullptr) rt->reset_stats();
+
+    auto start = std::chrono::steady_clock::now();
+    if (strcmp(impl, "serial") == 0) {
+      result = run_serial();
+    } else if (strcmp(impl, "omp") == 0) {
+      result = run_omp();
+    } else {
+      rt->run([&result] { result = run_rt(); });
+    }
+    auto end = std::chrono::steady_clock::now();
+
+    if (r > 0) times.push_back(std::chrono::duration<double>(end - start).count());
+    if (rt != nullptr) stats = rt->total_stats();
+    if (strcmp(bench, "qsort") == 0) {
+      result = std::is_sorted(data.begin(), data.end()) ? 1 : -1;
+    }
   }
 
-  if (o.check) {
-    long expect;
-    if (o.bench == "qsort") expect = 1;
-    else { data = orig; expect = run_serial(); }
-    if (result != expect) {
-      fprintf(stderr, "CHECK FAILED: %s/%s got %ld expected %ld\n", o.bench.c_str(), o.impl.c_str(), result, expect);
+  if (check) {
+    long expected = 1;
+    if (strcmp(bench, "qsort") != 0) expected = run_serial();
+    if (result != expected) {
+      fprintf(stderr, "CHECK FAILED: %s/%s got %ld expected %ld\n", bench, impl, result, expected);
       return 1;
     }
   }
 
   std::sort(times.begin(), times.end());
-  double med = times[times.size() / 2], mn = times[0];
-  printf("%s,%s,%d,%ld,%ld,%.6f,%.6f,%ld,%llu,%llu,%llu\n", o.bench.c_str(), o.impl.c_str(), o.threads, o.n,
-         o.cutoff, med, mn, result, (unsigned long long)st.tasks, (unsigned long long)st.steals,
-         (unsigned long long)st.steal_attempts);
+  printf("%s,%s,%d,%ld,%ld,%.6f,%.6f,%ld,%llu,%llu,%llu\n", bench, impl, threads, n, cutoff,
+         times[times.size() / 2], times[0], result, (unsigned long long)stats.tasks,
+         (unsigned long long)stats.steals, (unsigned long long)stats.steal_attempts);
+  delete rt;
   return 0;
 }
