@@ -22,7 +22,7 @@ The runtime works: Chase-Lev deques, spawn/sync, random stealing, plus a central
 
 ## Schedule
 
-| When | Task | Status |
+| When | Task (all Roger) | Status |
 |---|---|---|
 | Nov 9–15 | Thread pool, deque, stress tests on ARM, spawn/sync, fib working | done |
 | Nov 16–22 | Quicksort, n-queens, UTS; serial and OpenMP versions; central queue; first speedup graphs | done |
